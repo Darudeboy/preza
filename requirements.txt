@@ -1,0 +1,8 @@
+atlassian-python-api
+customtkinter
+python-dotenv
+requests
+urllib3
+langchain-core
+langgraph
+pillow
