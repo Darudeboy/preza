@@ -21,6 +21,7 @@ from config import JiraConfig, CONFLUENCE_URL, CONFLUENCE_TOKEN, CONFLUENCE_SPAC
 from service import JiraService
 from history import OperationHistory
 from lt import run_lt_check_with_target
+from rqg import run_rqg_check
 from master_analyzer import MasterServicesAnalyzer, ConfluenceDeployPlanGenerator
 
 # === ИМПОРТЫ ДЛЯ ИИ-АГЕНТА ===
@@ -151,6 +152,82 @@ class BlastAIAssistant:
         self.llm = SberGigaChatHR().bind_tools([])
         self._setup_graph()
 
+    def _extract_tool_calls_from_text(self, content: str):
+        """Fallback-парсер tool-команд из текстового ответа модели."""
+        if not content:
+            return [], ""
+
+        tool_calls = []
+        remaining = content
+
+        def add_tool_call(name: str, args: dict):
+            if not name:
+                return
+            safe_args = args if isinstance(args, dict) else {}
+            tool_calls.append({
+                "name": str(name),
+                "args": safe_args,
+                "id": os.urandom(8).hex(),
+            })
+
+        # Попытка 1: JSON-блок или объект целиком.
+        json_candidates = []
+        fenced = re.findall(r"```json\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE)
+        if fenced:
+            json_candidates.extend(fenced)
+        json_candidates.append(content)
+
+        for candidate in json_candidates:
+            parsed = None
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                try:
+                    parsed = ast.literal_eval(candidate)
+                except Exception:
+                    parsed = None
+
+            if not isinstance(parsed, dict):
+                continue
+
+            if parsed.get("tool"):
+                args = {k: v for k, v in parsed.items() if k != "tool"}
+                add_tool_call(parsed.get("tool"), args)
+                remaining = remaining.replace(candidate, "").strip()
+            elif parsed.get("name") and isinstance(parsed.get("args"), dict):
+                add_tool_call(parsed.get("name"), parsed.get("args"))
+                remaining = remaining.replace(candidate, "").strip()
+            elif isinstance(parsed.get("commands"), list):
+                for cmd in parsed["commands"]:
+                    if not isinstance(cmd, dict):
+                        continue
+                    name = cmd.get("tool") or cmd.get("name")
+                    args = cmd.get("args", {})
+                    if name:
+                        add_tool_call(name, args)
+                remaining = remaining.replace(candidate, "").strip()
+
+        # Попытка 2: отдельные словари внутри текста.
+        if not tool_calls and "{" in content:
+            matches = re.findall(r"\{[^{}]+\}", content)
+            for match in matches:
+                try:
+                    action = ast.literal_eval(match)
+                except Exception:
+                    continue
+                if not isinstance(action, dict):
+                    continue
+
+                if action.get("tool"):
+                    args = {k: v for k, v in action.items() if k != "tool"}
+                    add_tool_call(action.get("tool"), args)
+                    remaining = remaining.replace(match, "")
+                elif action.get("name") and isinstance(action.get("args"), dict):
+                    add_tool_call(action.get("name"), action.get("args"))
+                    remaining = remaining.replace(match, "")
+
+        return tool_calls, remaining.strip()
+
     def _setup_graph(self):
         @tool("get_jira_status")
         def get_jira_status(issue_key: str) -> str:
@@ -212,6 +289,21 @@ class BlastAIAssistant:
                 report = run_lt_check_with_target(release_key, 45)
                 return f"Отчет по Lead Time для релиза {release_key} успешно сформирован:\\n\\n{report}"
             except Exception as e: return f"Ошибка проверки LT: {e}"
+
+        @tool("check_rqg")
+        def check_rqg(release_key: str, max_depth: int = 2) -> str:
+            """
+            Запускает RQG-проверки по вложенным Story:
+            - соответствие статусов ЦО
+            - соответствие статусов ИФТ
+            - наличие/статус приложенного дистрибутива
+            """
+            self.app_gui.append_ai_chat(f"🛠️ [Агент] Запускаю RQG-проверки для релиза {release_key}...\\n")
+            try:
+                report = run_rqg_check(self.app_gui.jira_service, release_key, max_depth=max_depth)
+                return report
+            except Exception as e:
+                return f"Ошибка RQG-проверки: {e}"
 
         @tool("update_architecture_status")
         def update_architecture_status(release_key: str) -> str:
@@ -295,40 +387,52 @@ class BlastAIAssistant:
             except Exception as e:
                 result_lines.append(f"2) LT проверка: ошибка ({e})")
 
+            try:
+                rqg_report = run_rqg_check(self.app_gui.jira_service, issue_key, max_depth=2)
+                result_lines.append("3) RQG-проверка: выполнена")
+                rqg_lines = []
+                for line in rqg_report.splitlines():
+                    if "Story проверено:" in line or "Пройдено:" in line or "Не пройдено:" in line:
+                        rqg_lines.append(line.strip())
+                if rqg_lines:
+                    result_lines.extend([f"   {line}" for line in rqg_lines[:3]])
+            except Exception as e:
+                result_lines.append(f"3) RQG-проверка: ошибка ({e})")
+
             analysis = None
             try:
                 if self.app_gui.master_analyzer:
                     analysis = self.app_gui.master_analyzer.analyze_release(issue_key)
                     if analysis.get("success"):
                         result_lines.append(
-                            f"3) Master-check: OK, сервисов в master = {len(analysis.get('services', []))}"
+                            f"4) Master-check: OK, сервисов в master = {len(analysis.get('services', []))}"
                         )
                     else:
                         result_lines.append(
-                            f"3) Master-check: ошибка анализа ({analysis.get('message', 'unknown')})"
+                            f"4) Master-check: ошибка анализа ({analysis.get('message', 'unknown')})"
                         )
                 else:
-                    result_lines.append("3) Master-check: модуль не инициализирован")
+                    result_lines.append("4) Master-check: модуль не инициализирован")
             except Exception as e:
-                result_lines.append(f"3) Master-check: ошибка ({e})")
+                result_lines.append(f"4) Master-check: ошибка ({e})")
 
             bt_requested = str(create_bt).strip().lower() in ("1", "true", "yes", "y", "да")
             if bt_requested:
                 if not safe_project:
-                    result_lines.append("4) БТ: пропущено (нужен project_key)")
+                    result_lines.append("5) БТ: пропущено (нужен project_key)")
                 else:
                     try:
                         bt_result = create_business_requirements.invoke(
                             {"issue_key": issue_key, "project_key": safe_project}
                         )
-                        result_lines.append(f"4) БТ: {bt_result}")
+                        result_lines.append(f"5) БТ: {bt_result}")
                     except Exception as e:
-                        result_lines.append(f"4) БТ: ошибка ({e})")
+                        result_lines.append(f"5) БТ: ошибка ({e})")
 
             deploy_requested = str(create_deploy).strip().lower() in ("1", "true", "yes", "y", "да")
             if deploy_requested:
                 if not analysis or not analysis.get("success"):
-                    result_lines.append("5) Deploy plan: пропущено (сначала нужен успешный master-check)")
+                    result_lines.append("6) Deploy plan: пропущено (сначала нужен успешный master-check)")
                 else:
                     try:
                         deploy = self.app_gui.master_analyzer.generate_deploy_plan(
@@ -338,13 +442,13 @@ class BlastAIAssistant:
                             team_name=TEAM_NAME,
                         )
                         if deploy.get("success"):
-                            result_lines.append(f"5) Deploy plan: создан ({deploy.get('page_url')})")
+                            result_lines.append(f"6) Deploy plan: создан ({deploy.get('page_url')})")
                         else:
                             result_lines.append(
-                                f"5) Deploy plan: ошибка ({deploy.get('message', 'unknown')})"
+                                f"6) Deploy plan: ошибка ({deploy.get('message', 'unknown')})"
                             )
                     except Exception as e:
-                        result_lines.append(f"5) Deploy plan: ошибка ({e})")
+                        result_lines.append(f"6) Deploy plan: ошибка ({e})")
 
             result_lines.append("-" * 60)
             result_lines.append("Готово. Пришли команду для следующего шага (например: 'переведи в Ready for Prod').")
@@ -355,6 +459,7 @@ class BlastAIAssistant:
             "create_deploy_plan": create_deploy_plan,
             "create_business_requirements": create_business_requirements,
             "check_lead_time": check_lead_time,
+            "check_rqg": check_rqg,
             "update_architecture_status": update_architecture_status,
             "move_release_status": move_release_status,
             "run_release_pipeline": run_release_pipeline,
@@ -376,9 +481,10 @@ class BlastAIAssistant:
                 "2. Создать Деплой-План -> 'create_deploy_plan' (нужен issue_key релиза)\\n"
                 "3. Бизнес-Требования (БТ/ФР) -> 'create_business_requirements' (нужен issue_key релиза и project_key проекта, например SFILE)\\n"
                 "4. Проверка Lead Time (LT) -> 'check_lead_time' (нужен ТОЛЬКО issue_key релиза. Скрипт сам найдет все задачи внутри).\\n"
-                "5. Проставить архитектуру -> 'update_architecture_status' (нужен issue_key релиза)\\n"
-                "6. Перевести релиз в нужный статус -> 'move_release_status' (issue_key + target_status)\\n"
-                "7. Полный релизный прогон -> 'run_release_pipeline' (issue_key, опц. project_key, target_lt, create_bt, create_deploy)\\n\\n"
+                "5. RQG-проверка (ЦО/ИФТ/дистрибутив) -> 'check_rqg' (release_key, опц. max_depth)\\n"
+                "6. Проставить архитектуру -> 'update_architecture_status' (нужен issue_key релиза)\\n"
+                "7. Перевести релиз в нужный статус -> 'move_release_status' (issue_key + target_status)\\n"
+                "8. Полный релизный прогон -> 'run_release_pipeline' (issue_key, опц. project_key, target_lt, create_bt, create_deploy)\\n\\n"
                 "ПРАВИЛА ВЫЗОВА ИНСТРУМЕНТОВ:\\n"
                 "- Если пользователь просит проверить LT для релиза и указывает проект (например, 'LT SFILE для HRPRELEASE-123'), вызови инструмент 'check_lead_time' с ключом релиза. Получив отчет от скрипта, ВЫВЕДИ В ЧАТ ТОЛЬКО ТЕ СТРОКИ ИЗ ОТЧЕТА, КОТОРЫЕ ОТНОСЯТСЯ К ЗАПРОШЕННОМУ ПРОЕКТУ (SFILE).\\n"
                 "- Если пользователь просит выполнить сразу несколько действий, выведи НЕСКОЛЬКО ОТДЕЛЬНЫХ JSON-словарей подряд в формате: {'tool': 'имя_инструмента', 'ключ': 'значение'}.\\n"
@@ -392,11 +498,20 @@ class BlastAIAssistant:
             if m and msgs[-1].type == "human":
                 msgs[-1] = HumanMessage(content=f"{msgs[-1].content}\\n[Контекст: упоминается релиз {m.group(1).upper()}]")
 
-            return {"messages": [self.llm.invoke([sys_msg] + msgs)]}
+            response = self.llm.invoke([sys_msg] + msgs)
+            fallback_calls, cleaned_content = self._extract_tool_calls_from_text(response.content or "")
+            if not getattr(response, "tool_calls", None) and fallback_calls:
+                response = AIMessage(content=cleaned_content, tool_calls=fallback_calls)
+            return {"messages": [response]}
 
         def execute_tools(state: AgentState):
             results = []
-            for tc in getattr(state["messages"][-1], "tool_calls", []) or []:
+            last_message = state["messages"][-1]
+            tool_calls = getattr(last_message, "tool_calls", []) or []
+            if not tool_calls and getattr(last_message, "content", None):
+                tool_calls, _ = self._extract_tool_calls_from_text(last_message.content)
+
+            for tc in tool_calls:
                 name = tc.get("name")
                 args = tc.get("args") or {}
                 if name in self.tools_map:
@@ -413,7 +528,17 @@ class BlastAIAssistant:
         workflow.add_node("agent", call_model)
         workflow.add_node("action", execute_tools)
         workflow.set_entry_point("agent")
-        workflow.add_conditional_edges("agent", lambda s: "continue" if getattr(s["messages"][-1], "tool_calls", None) else "end", {"continue": "action", "end": END})
+        def should_continue(state: AgentState):
+            last_message = state["messages"][-1]
+            if getattr(last_message, "tool_calls", None):
+                return "continue"
+            if getattr(last_message, "content", None):
+                parsed_calls, _ = self._extract_tool_calls_from_text(last_message.content)
+                if parsed_calls:
+                    return "continue"
+            return "end"
+
+        workflow.add_conditional_edges("agent", should_continue, {"continue": "action", "end": END})
         workflow.add_edge("action", "agent")
         self.app_graph = workflow.compile()
 
@@ -424,7 +549,10 @@ class BlastAIAssistant:
                 if "agent" in out:
                     msg = out["agent"]["messages"][-1]
                     self.memory.append(msg)
-                    if (msg.content or "").strip():
+                    tool_calls = getattr(msg, "tool_calls", []) or []
+                    if not tool_calls and (msg.content or "").strip():
+                        tool_calls, _ = self._extract_tool_calls_from_text(msg.content)
+                    if (msg.content or "").strip() and not tool_calls:
                         self.app_gui.append_ai_chat(f"🤖 Blast AI: {msg.content}\\n\\n")
                 if "action" in out:
                     self.memory.extend(out["action"]["messages"])
@@ -604,9 +732,10 @@ class ModernJiraApp(ctk.CTk):
         # Приветственное сообщение
         self.append_ai_chat(
             "🤖 Blast AI: Готов к работе с релизом.\\n"
-            "Доступно: проверка статуса, LT, master-check, создание БТ, деплой-плана и перевод статуса релиза.\\n"
+            "Доступно: проверка статуса, LT, RQG, master-check, создание БТ, деплой-плана и перевод статуса релиза.\\n"
             "Примеры команд:\\n"
             "• Проверь статус HRPRELEASE-111135\\n"
+            "• Проверь RQG для HRPRELEASE-111135\\n"
             "• Запусти полный пайплайн для HRPRELEASE-111135, проект SFILE\\n"
             "• Переведи HRPRELEASE-111135 в Ready for Prod\\n\\n"
         )
@@ -795,6 +924,17 @@ class ModernJiraApp(ctk.CTk):
 
         self.lt_btn = ctk.CTkButton(buttons_frame, text="📊 Проверка LT", command=self.run_lt_check, font=ctk.CTkFont(size=14), height=40)
         self.lt_btn.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
+
+        self.rqg_btn = ctk.CTkButton(
+            buttons_frame,
+            text="🛡 Проверка RQG",
+            command=self.run_rqg_check,
+            font=ctk.CTkFont(size=14),
+            height=40,
+            fg_color="#5C6BC0",
+            hover_color="#3F51B5",
+        )
+        self.rqg_btn.grid(row=2, column=0, padx=5, pady=5, sticky="ew")
 
         self.master_btn = ctk.CTkButton(buttons_frame, text="🔀 Мастер-ветки", command=self.analyze_master_services, font=ctk.CTkFont(size=14), height=40, fg_color="#4CAF50", hover_color="#45a049")
         self.master_btn.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
@@ -1066,6 +1206,37 @@ Jira Automation Tool + Confluence Deploy Plans
                 def show_error():
                     self.results_text.delete("1.0", "end")
                     self.results_text.insert("1.0", f"Ошибка: {error_msg}")
+                self.after(0, show_error)
+
+        threading.Thread(target=process, daemon=True).start()
+
+    def run_rqg_check(self):
+        release_key = self.release_entry.get().strip()
+        if not release_key:
+            messagebox.showwarning("Ошибка", "Введите ключ релиза!")
+            return
+
+        self.results_text.delete("1.0", "end")
+        self.results_text.insert("1.0", f"Запуск RQG-проверки для {release_key}...\\n")
+
+        def process():
+            try:
+                report = run_rqg_check(self.jira_service, release_key, max_depth=2)
+
+                def show_report():
+                    self.results_text.delete("1.0", "end")
+                    self.results_text.insert("1.0", report)
+
+                self.after(0, show_report)
+                self.history.add("RQG-проверка", {'release': release_key})
+                self.history.save_to_file(self.history_path)
+            except Exception as e:
+                error_msg = str(e)
+
+                def show_error():
+                    self.results_text.delete("1.0", "end")
+                    self.results_text.insert("1.0", f"Ошибка RQG-проверки: {error_msg}")
+
                 self.after(0, show_error)
 
         threading.Thread(target=process, daemon=True).start()
@@ -1534,6 +1705,7 @@ Jira Automation Tool + Confluence Deploy Plans
         self.cleanup_btn.configure(state=state)
         self.remove_all_btn.configure(state=state)
         self.lt_btn.configure(state=state)
+        self.rqg_btn.configure(state=state)
         self.master_btn.configure(state=state)
         self.release_entry.configure(state=state)
         self.version_entry.configure(state=state)

@@ -6,6 +6,7 @@ Production-ready release automation assistant.
 
 - Jira release operations (link / cleanup / remove links)
 - LT check for release-linked issues
+- RQG checks for nested stories (CO/IFT/distribution)
 - Master branch analysis (PR -> services)
 - Deploy plan generation in Confluence
 - Business requirements (BT/FR) generation
@@ -43,6 +44,14 @@ CONFLUENCE_TEMPLATE_PAGE_ID=18532011154
 TEAM_NAME=Команда
 GIGACHAT_USERNAME=...
 GIGACHAT_PASSWORD=...
+
+# Optional RQG tuning
+RQG_CO_KEYWORDS=цо,co
+RQG_IFT_KEYWORDS=ифт,ift
+RQG_DISTRIBUTION_KEYWORDS=дистриб,distrib,release-notes,install
+RQG_CO_ALLOWED_STATUSES=Done,Closed,Resolved,Выполнено,Закрыто
+RQG_IFT_ALLOWED_STATUSES=Done,Closed,Resolved,Выполнено,Закрыто
+RQG_DISTRIBUTION_ALLOWED_STATUSES=Done,Closed,Resolved,Выполнено,Закрыто
 ```
 
 3. Run app:
