@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 
 
 def _split_csv(value: str, fallback: List[str]) -> List[str]:
@@ -179,6 +179,18 @@ def analyze_rqg_for_release(jira_service, release_key: str, max_depth: int = 2) 
     }
 
 
+def trigger_rqg_button(jira_service, release_key: str, button_name: Optional[str] = None) -> Dict:
+    """Нажимает кнопку/переход RQG в Jira на релизной задаче."""
+    transition_name = (button_name or os.getenv("RQG_TRANSITION_NAME", "RQG")).strip()
+    ok, message = jira_service.transition_issue(release_key, transition_name)
+    return {
+        "success": ok,
+        "release_key": release_key,
+        "transition_name": transition_name,
+        "message": message,
+    }
+
+
 def format_rqg_report(result: Dict) -> str:
     if not result.get("success"):
         return f"❌ RQG: {result.get('message', 'Неизвестная ошибка')}"
@@ -220,6 +232,28 @@ def _short(text: str, limit: int = 70) -> str:
     return f"{text[:limit - 3]}..."
 
 
-def run_rqg_check(jira_service, release_key: str, max_depth: int = 2) -> str:
+def run_rqg_check(
+    jira_service,
+    release_key: str,
+    max_depth: int = 2,
+    trigger_button: bool = True,
+    button_name: Optional[str] = None,
+) -> str:
+    lines: List[str] = []
+    if trigger_button:
+        trigger_result = trigger_rqg_button(jira_service, release_key, button_name=button_name)
+        if trigger_result["success"]:
+            lines.append(
+                f"✅ Jira-кнопка RQG нажата: {trigger_result['transition_name']} "
+                f"({trigger_result['release_key']})"
+            )
+        else:
+            lines.append(
+                f"⚠️ Не удалось нажать Jira-кнопку RQG "
+                f"('{trigger_result['transition_name']}'): {trigger_result['message']}"
+            )
+        lines.append("")
+
     result = analyze_rqg_for_release(jira_service=jira_service, release_key=release_key, max_depth=max_depth)
-    return format_rqg_report(result)
+    lines.append(format_rqg_report(result))
+    return "\n".join(lines)

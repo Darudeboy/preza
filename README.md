@@ -52,6 +52,7 @@ RQG_DISTRIBUTION_KEYWORDS=дистриб,distrib,release-notes,install
 RQG_CO_ALLOWED_STATUSES=Done,Closed,Resolved,Выполнено,Закрыто
 RQG_IFT_ALLOWED_STATUSES=Done,Closed,Resolved,Выполнено,Закрыто
 RQG_DISTRIBUTION_ALLOWED_STATUSES=Done,Closed,Resolved,Выполнено,Закрыто
+RQG_TRANSITION_NAME=RQG
 ```
 
 3. Run app:

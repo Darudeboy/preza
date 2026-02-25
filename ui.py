@@ -291,7 +291,7 @@ class BlastAIAssistant:
             except Exception as e: return f"Ошибка проверки LT: {e}"
 
         @tool("check_rqg")
-        def check_rqg(release_key: str, max_depth: int = 2) -> str:
+        def check_rqg(release_key: str, max_depth: int = 2, trigger_button: bool = True) -> str:
             """
             Запускает RQG-проверки по вложенным Story:
             - соответствие статусов ЦО
@@ -300,7 +300,12 @@ class BlastAIAssistant:
             """
             self.app_gui.append_ai_chat(f"🛠️ [Агент] Запускаю RQG-проверки для релиза {release_key}...\\n")
             try:
-                report = run_rqg_check(self.app_gui.jira_service, release_key, max_depth=max_depth)
+                report = run_rqg_check(
+                    self.app_gui.jira_service,
+                    release_key,
+                    max_depth=max_depth,
+                    trigger_button=trigger_button,
+                )
                 return report
             except Exception as e:
                 return f"Ошибка RQG-проверки: {e}"
@@ -342,7 +347,7 @@ class BlastAIAssistant:
         def run_release_pipeline(
             issue_key: str,
             project_key: str = "",
-            target_lt: float = 45,
+            target_lt: float | None = 45,
             create_bt: bool = False,
             create_deploy: bool = False,
         ) -> str:
@@ -369,10 +374,7 @@ class BlastAIAssistant:
             except Exception as e:
                 result_lines.append(f"1) Jira статус: ошибка ({e})")
 
-            try:
-                safe_target_lt = float(target_lt)
-            except Exception:
-                safe_target_lt = 45.0
+            safe_target_lt = 45.0 if target_lt is None else float(target_lt)
 
             try:
                 lt_report = run_lt_check_with_target(issue_key, safe_target_lt)
@@ -388,7 +390,12 @@ class BlastAIAssistant:
                 result_lines.append(f"2) LT проверка: ошибка ({e})")
 
             try:
-                rqg_report = run_rqg_check(self.app_gui.jira_service, issue_key, max_depth=2)
+                rqg_report = run_rqg_check(
+                    self.app_gui.jira_service,
+                    issue_key,
+                    max_depth=2,
+                    trigger_button=True,
+                )
                 result_lines.append("3) RQG-проверка: выполнена")
                 rqg_lines = []
                 for line in rqg_report.splitlines():
@@ -1221,7 +1228,12 @@ Jira Automation Tool + Confluence Deploy Plans
 
         def process():
             try:
-                report = run_rqg_check(self.jira_service, release_key, max_depth=2)
+                report = run_rqg_check(
+                    self.jira_service,
+                    release_key,
+                    max_depth=2,
+                    trigger_button=True,
+                )
 
                 def show_report():
                     self.results_text.delete("1.0", "end")
