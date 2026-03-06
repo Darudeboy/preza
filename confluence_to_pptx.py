@@ -37,17 +37,20 @@ logger = logging.getLogger(__name__)
 
 class ConfluenceReleaseStats:
     def __init__(self):
+        confluence_token = os.getenv("CONFLUENCE_TOKEN") or os.getenv("ATLASSIAN_TOKEN") or os.getenv("TOKEN")
+        jira_token = os.getenv("JIRA_TOKEN") or os.getenv("ATLASSIAN_TOKEN") or ""
+
         self.config = {
             "confluence": {
                 "url": os.getenv("CONFLUENCE_URL", "https://confluence.sberbank.ru"),
-                "token": os.getenv("CONFLUENCE_TOKEN"),
+                "token": confluence_token,
                 "space": os.getenv("CONFLUENCE_SPACE", "HRTECH"),
                 "source_page_id": os.getenv("SOURCE_PAGE_ID", "18588013525"),
                 "verify_ssl": os.getenv("CONFLUENCE_VERIFY_SSL", "false").lower() == "true",
             },
             "jira": {
                 "url": os.getenv("JIRA_URL", "https://jira.sberbank.ru"),
-                "token": os.getenv("JIRA_TOKEN"),
+                "token": jira_token,
                 "verify_ssl": os.getenv("JIRA_VERIFY_SSL", "false").lower() == "true",
             },
             "pptx": {
@@ -63,9 +66,10 @@ class ConfluenceReleaseStats:
             "RELEASE_STATUSES",
             ["Установлен на ПРОМ", "Готов", "Установка на ПРОМ"],
         )
+        # Если переменная не задана, НЕ фильтруем по ключевым словам
         self.mobile_keywords = self.parse_csv_env(
             "MOBILE_RELEASE_KEYWORDS",
-            ["rn", "react native", "android", "ios", "мп", "mobile"],
+            [],
         )
 
         self.headers = {
@@ -88,6 +92,21 @@ class ConfluenceReleaseStats:
         if not value.strip():
             return list(default_values)
         return [item.strip() for item in value.split(",") if item.strip()]
+
+    @staticmethod
+    def save_dump_json(data: List[Dict], filename: str = "releases_dump.json") -> None:
+        import json
+
+        serializable = []
+        for row in data:
+            copied = dict(row)
+            if isinstance(copied.get("datetime"), datetime):
+                copied["datetime"] = copied["datetime"].isoformat()
+            serializable.append(copied)
+
+        with open(filename, "w", encoding="utf-8") as file_obj:
+            json.dump(serializable, file_obj, ensure_ascii=False, indent=2)
+        logger.info("💾 Дамп релизов сохранен: %s", filename)
 
     @staticmethod
     def normalize_header_name(value: str) -> str:
@@ -403,7 +422,10 @@ class ConfluenceReleaseStats:
     def filter_weekly_mobile_releases(self, releases: List[Dict]) -> List[Dict]:
         week_start, week_end = self.current_week_range()
         logger.info("📅 Фильтруем релизы за неделю: %s - %s", week_start.strftime("%d.%m.%Y"), week_end.strftime("%d.%m.%Y"))
-        logger.info("📌 Ключевые слова мобильных релизов: %s", ", ".join(self.mobile_keywords))
+        if self.mobile_keywords:
+            logger.info("📌 Ключевые слова фильтра: %s", ", ".join(self.mobile_keywords))
+        else:
+            logger.info("📌 Фильтр по ключевым словам отключен (берем все релизы недели)")
 
         filtered = []
         for release in releases:
@@ -438,7 +460,9 @@ class ConfluenceReleaseStats:
         return filtered
 
     def build_slide_lines(self, releases: List[Dict]) -> List[str]:
+        week_start, week_end = self.current_week_range()
         lines = [self.config["pptx"]["section_title"], "--"]
+        lines.append(f"Период: {week_start.strftime('%d.%m.%Y')} - {week_end.strftime('%d.%m.%Y')}")
         if not releases:
             lines.append("Релизов не найдено")
             return lines
@@ -498,7 +522,7 @@ class ConfluenceReleaseStats:
             paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
             paragraph.text = line
             paragraph.level = 0
-            paragraph.font.size = Pt(14 if index < 2 else 12)
+            paragraph.font.size = Pt(14 if index < 3 else 12)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         presentation.save(str(output_path))
@@ -523,6 +547,8 @@ class ConfluenceReleaseStats:
             logger.error("❌ После парсинга не найдено ни одного релиза")
             return False
 
+        # Фиксируем результат выгрузки отдельным файлом перед формированием презентации.
+        self.save_dump_json(releases)
         weekly_mobile_releases = self.filter_weekly_mobile_releases(releases)
         self.update_presentation(weekly_mobile_releases)
 
@@ -533,18 +559,13 @@ class ConfluenceReleaseStats:
 def main() -> int:
     logger.info("▶️ Старт confluence_to_pptx.py")
 
-    required_vars = ["CONFLUENCE_TOKEN"]
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    if missing_vars:
-        logger.error("❌ Отсутствуют переменные окружения: %s", ", ".join(missing_vars))
-        logger.info("Добавьте в .env минимум:")
-        logger.info("CONFLUENCE_TOKEN=ваш_токен")
-        logger.info("PPTX_TEMPLATE_PATH=/путь/к/шаблону.pptx")
-        logger.info("SOURCE_PAGE_ID=18588013525")
-        return 1
-
     try:
         reporter = ConfluenceReleaseStats()
+        if not reporter.config["confluence"]["token"]:
+            logger.error(
+                "❌ Не найден токен Confluence. Проверены переменные: CONFLUENCE_TOKEN, ATLASSIAN_TOKEN, TOKEN"
+            )
+            return 1
         return 0 if reporter.generate_weekly_presentation() else 1
     except Exception as exc:
         logger.exception("💥 Критическая ошибка: %s", exc)
