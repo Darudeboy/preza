@@ -4,17 +4,29 @@
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from pptx import Presentation
-from pptx.util import Pt
-from urllib3.exceptions import InsecureRequestWarning
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    from dotenv import load_dotenv
+    from pptx import Presentation
+    from pptx.util import Pt
+    from urllib3.exceptions import InsecureRequestWarning
+except ModuleNotFoundError as exc:
+    missing = str(exc).split("'")[1] if "'" in str(exc) else str(exc)
+    print(
+        "Ошибка запуска: не хватает python-библиотек.\n"
+        f"Не найден модуль: {missing}\n\n"
+        "Установите зависимости:\n"
+        "python3 -m pip install requests python-dotenv urllib3 beautifulsoup4 python-pptx",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 load_dotenv()
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -75,6 +87,18 @@ class ReleaseParser:
         self.allowed_statuses = set(allowed_statuses)
 
     @staticmethod
+    def _normalize_header_name(value: str) -> str:
+        return " ".join(value.strip().lower().replace("\n", " ").split())
+
+    @staticmethod
+    def _find_column_index(headers: List[str], *aliases: str) -> Optional[int]:
+        normalized_aliases = {alias.strip().lower() for alias in aliases}
+        for idx, header in enumerate(headers):
+            if header in normalized_aliases:
+                return idx
+        return None
+
+    @staticmethod
     def parse_date(text: str) -> Optional[datetime]:
         for pattern in DATE_PATTERNS:
             match = re.search(r"\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4}", text)
@@ -108,18 +132,42 @@ class ReleaseParser:
             rows = table.find_all("tr")
             if len(rows) < 2:
                 continue
+
+            header_cells = rows[0].find_all(["th", "td"])
+            headers = [self._normalize_header_name(cell.get_text(" ", strip=True)) for cell in header_cells]
+            if not headers:
+                continue
+
+            type_idx = self._find_column_index(headers, "тип")
+            id_idx = self._find_column_index(headers, "id релиза", "id")
+            date_idx = self._find_column_index(headers, "дата", "дата релиза")
+            status_idx = self._find_column_index(headers, "статус")
+            description_idx = self._find_column_index(headers, "описание релиза", "описание")
+            responsible_idx = self._find_column_index(headers, "ответственный")
+
+            if id_idx is None or status_idx is None:
+                continue
+
             for row in rows[1:]:
                 cells = row.find_all(["td", "th"])
-                if len(cells) < 5:
+                if len(cells) <= max(id_idx, status_idx):
                     continue
 
-                raw_type = cells[0].get_text(" ", strip=True) if len(cells) > 0 else ""
-                release_cell = cells[1] if len(cells) > 1 else None
+                raw_type = cells[type_idx].get_text(" ", strip=True) if type_idx is not None and len(cells) > type_idx else ""
+                release_cell = cells[id_idx] if len(cells) > id_idx else None
                 raw_release = release_cell.get_text(" ", strip=True) if release_cell else ""
-                raw_date = cells[2].get_text(" ", strip=True) if len(cells) > 2 else ""
-                raw_status = cells[3].get_text(" ", strip=True) if len(cells) > 3 else ""
-                raw_description = cells[4].get_text(" ", strip=True) if len(cells) > 4 else ""
-                raw_responsible = cells[5].get_text(" ", strip=True) if len(cells) > 5 else ""
+                raw_date = cells[date_idx].get_text(" ", strip=True) if date_idx is not None and len(cells) > date_idx else ""
+                raw_status = cells[status_idx].get_text(" ", strip=True) if len(cells) > status_idx else ""
+                raw_description = (
+                    cells[description_idx].get_text(" ", strip=True)
+                    if description_idx is not None and len(cells) > description_idx
+                    else ""
+                )
+                raw_responsible = (
+                    cells[responsible_idx].get_text(" ", strip=True)
+                    if responsible_idx is not None and len(cells) > responsible_idx
+                    else ""
+                )
 
                 release_key = self._extract_release_key(raw_release)
                 if not release_key:
@@ -238,9 +286,11 @@ def parse_csv_env(name: str, default_values: Sequence[str]) -> List[str]:
 
 
 def main() -> int:
+    logger.info("Старт скрипта confluence_to_pptx.py")
     confluence_token = os.getenv("CONFLUENCE_TOKEN")
     if not confluence_token:
         logger.error("CONFLUENCE_TOKEN не задан.")
+        logger.error("Добавьте токен в переменную окружения или в .env файл рядом со скриптом.")
         return 1
 
     template_pptx = Path(os.getenv("PPTX_TEMPLATE_PATH", "/Users/asklimenko/Downloads/ОС ЦРФК 20.02.pptx"))
@@ -266,26 +316,34 @@ def main() -> int:
     slide_index = int(os.getenv("PPTX_SLIDE_INDEX", "1")) - 1
     marker_text = os.getenv("PPTX_RELEASES_MARKER", "Релизов не найдено")
 
-    logger.info("Загружаем релизы из Confluence pageId=%s", source_page_id)
-    html_content = confluence_client.get_page_html(source_page_id)
-    parser = ReleaseParser(allowed_statuses=allowed_statuses)
-    all_releases = parser.parse_html_table(html_content)
-    logger.info("Найдено релизов по статусам: %d", len(all_releases))
+    try:
+        logger.info("Загружаем релизы из Confluence pageId=%s", source_page_id)
+        html_content = confluence_client.get_page_html(source_page_id)
+        parser = ReleaseParser(allowed_statuses=allowed_statuses)
+        all_releases = parser.parse_html_table(html_content)
+        logger.info("Найдено релизов по статусам: %d", len(all_releases))
 
-    week_start, week_end = current_week_range()
-    logger.info("Анализируем период: %s - %s", week_start.strftime("%d.%m.%Y"), week_end.strftime("%d.%m.%Y"))
-    weekly_mobile_releases = filter_releases(all_releases, week_start, week_end, mobile_keywords)
-    logger.info("Мобильных релизов за неделю: %d", len(weekly_mobile_releases))
+        week_start, week_end = current_week_range()
+        logger.info("Анализируем период: %s - %s", week_start.strftime("%d.%m.%Y"), week_end.strftime("%d.%m.%Y"))
+        weekly_mobile_releases = filter_releases(all_releases, week_start, week_end, mobile_keywords)
+        logger.info("Мобильных релизов за неделю: %d", len(weekly_mobile_releases))
 
-    updater = PptxUpdater(
-        template_path=template_pptx,
-        output_path=output_pptx,
-        slide_index=slide_index,
-        marker_text=marker_text,
-    )
-    updater.update_first_slide(weekly_mobile_releases)
-    logger.info("Презентация обновлена: %s", output_pptx)
-    return 0
+        updater = PptxUpdater(
+            template_path=template_pptx,
+            output_path=output_pptx,
+            slide_index=slide_index,
+            marker_text=marker_text,
+        )
+        updater.update_first_slide(weekly_mobile_releases)
+        logger.info("Презентация обновлена: %s", output_pptx)
+        return 0
+    except requests.HTTPError as exc:
+        logger.error("HTTP ошибка при работе с Confluence: %s", exc)
+    except requests.RequestException as exc:
+        logger.error("Сетевая ошибка при обращении к Confluence: %s", exc)
+    except Exception as exc:
+        logger.exception("Критическая ошибка выполнения: %s", exc)
+    return 1
 
 
 if __name__ == "__main__":
