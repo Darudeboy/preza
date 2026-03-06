@@ -213,6 +213,50 @@ def save_debug(html: str, releases: Sequence[Release]) -> None:
     logger.info("Сохранили debug файлы: %s, %s", DEBUG_HTML_PATH, DEBUG_JSON_PATH)
 
 
+def resolve_template_path(raw_path: str) -> Path:
+    """
+    Resolve template path robustly across different user homes and
+    localized Downloads directory names.
+    """
+    base = Path(raw_path).expanduser()
+    candidates = [base]
+
+    # Common ru/en directory-name swaps.
+    raw = str(base)
+    if "/Загрузки/" in raw:
+        candidates.append(Path(raw.replace("/Загрузки/", "/Downloads/")))
+    if "/Downloads/" in raw:
+        candidates.append(Path(raw.replace("/Downloads/", "/Загрузки/")))
+
+    # Same filename in current user's home download folders.
+    filename = base.name
+    home = Path.home()
+    candidates.append(home / "Downloads" / filename)
+    candidates.append(home / "Загрузки" / filename)
+
+    # Same filename in current working directory.
+    candidates.append(Path.cwd() / filename)
+
+    unique_candidates: List[Path] = []
+    seen = set()
+    for item in candidates:
+        normalized = str(item)
+        if normalized not in seen:
+            unique_candidates.append(item)
+            seen.add(normalized)
+
+    for item in unique_candidates:
+        if item.exists():
+            if item != base:
+                logger.info("Шаблон найден по альтернативному пути: %s", item)
+            return item
+
+    logger.error("Шаблон не найден. Проверены пути:")
+    for item in unique_candidates:
+        logger.error(" - %s", item)
+    raise FileNotFoundError(f"Шаблон не найден: {base}")
+
+
 def update_presentation(
     template_path: Path,
     output_path: Path,
@@ -223,8 +267,7 @@ def update_presentation(
     start: datetime,
     end: datetime,
 ) -> None:
-    if not template_path.exists():
-        raise FileNotFoundError(f"Шаблон не найден: {template_path}")
+    template_path = resolve_template_path(str(template_path))
 
     prs = Presentation(str(template_path))
     if slide_index < 0 or slide_index >= len(prs.slides):
@@ -299,7 +342,7 @@ def main() -> int:
     statuses = parse_csv_env("RELEASE_STATUSES", ["Установлен на ПРОМ", "Готов", "Установка на ПРОМ"])
     keywords = parse_csv_env("MOBILE_RELEASE_KEYWORDS", [])
 
-    template_path = Path(os.getenv("PPTX_TEMPLATE_PATH", "/Users/asklimenko/Downloads/ОС ЦРФК 20.02.pptx"))
+    template_path = Path(os.getenv("PPTX_TEMPLATE_PATH", "~/Downloads/ОС ЦРФК 20.02.pptx"))
     output_path = Path(os.getenv("PPTX_OUTPUT_PATH", str(template_path.with_name(f"{template_path.stem} (авто).pptx"))))
     slide_index = int(os.getenv("PPTX_SLIDE_INDEX", "1")) - 1
     marker_text = os.getenv("PPTX_RELEASES_MARKER", "Релизов не найдено")
