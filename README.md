@@ -65,3 +65,29 @@ python3 main.py
 
 - The project now runs entirely from `.py` sources.
 - Legacy `.txt` code snapshots have been removed.
+
+## Weekly releases to PPTX
+
+Use `confluence_to_pptx.py` to fill the first slide automatically with weekly mobile releases.
+
+Minimal `.env` values:
+
+```env
+CONFLUENCE_URL=https://confluence.sberbank.ru
+CONFLUENCE_TOKEN=...
+SOURCE_PAGE_ID=18588013525
+
+PPTX_TEMPLATE_PATH=/Users/asklimenko/Downloads/ОС ЦРФК 20.02.pptx
+PPTX_OUTPUT_PATH=/Users/asklimenko/Downloads/ОС ЦРФК 20.02 (авто).pptx
+PPTX_SLIDE_INDEX=1
+PPTX_RELEASES_MARKER=Релизов не найдено
+
+RELEASE_STATUSES=Установлен на ПРОМ,Установка на ПРОМ,Готов
+MOBILE_RELEASE_KEYWORDS=rn,android,ios,мп,mobile
+```
+
+Run:
+
+```bash
+python3 confluence_to_pptx.py
+```

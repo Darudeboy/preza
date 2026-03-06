@@ -6,3 +6,5 @@ urllib3
 langchain-core
 langgraph
 pillow
+beautifulsoup4
+python-pptx
