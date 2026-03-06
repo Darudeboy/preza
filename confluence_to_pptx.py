@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,10 @@ logger = logging.getLogger("confluence_to_pptx")
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+IOS_ID = "2257858"
+ANDROID_ID = "2935717"
+NEURO_IDS = ("9644020", "9643401", "9644023", "9644025")
+
 
 @dataclass
 class Release:
@@ -56,6 +61,10 @@ class Release:
     description: str
     responsible: str
     jira_link: str
+
+    @property
+    def blob(self) -> str:
+        return f"{self.key} {self.release_type} {self.description} {self.responsible}".lower()
 
 
 def load_env() -> None:
@@ -193,6 +202,144 @@ def filter_weekly(
     return out
 
 
+def detect_mobile_releases(releases: Sequence[Release]) -> List[Release]:
+    return [rel for rel in releases if IOS_ID in rel.blob or ANDROID_ID in rel.blob]
+
+
+def detect_main_releases(releases: Sequence[Release]) -> List[Release]:
+    return [rel for rel in releases if any(task_id in rel.blob for task_id in NEURO_IDS)]
+
+
+def pluralize_releases(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "релиз"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return "релиза"
+    return "релизов"
+
+
+def extract_versions(text: str) -> List[str]:
+    versions = re.findall(r"v\s?\d+\.\d+(?:\.\d+)?", text, flags=re.IGNORECASE)
+    unique: List[str] = []
+    seen = set()
+    for item in versions:
+        normalized = item.replace(" ", "").lower()
+        if normalized not in seen:
+            unique.append(item.strip())
+            seen.add(normalized)
+    return unique
+
+
+def summarize_mobile(releases: Sequence[Release]) -> str:
+    if not releases:
+        return "Релизов не было"
+
+    ios_releases = [rel for rel in releases if IOS_ID in rel.blob or "ios" in rel.blob]
+    android_releases = [rel for rel in releases if ANDROID_ID in rel.blob or "android" in rel.blob]
+
+    parts: List[str] = []
+    if android_releases:
+        parts.append("Android")
+    if ios_releases:
+        parts.append("iOS")
+    if not parts:
+        parts.append("RN/Android/iOS")
+
+    versions: List[str] = []
+    for rel in releases:
+        versions.extend(extract_versions(rel.description))
+    version_part = f" ({', '.join(versions)})" if versions else ""
+
+    return f"{len(releases)} {pluralize_releases(len(releases))} для МП ({', '.join(parts)}){version_part}"
+
+
+def summarize_main(releases: Sequence[Release]) -> str:
+    if not releases:
+        return "Релизов не было"
+    return f"{len(releases)} {pluralize_releases(len(releases))} Новой главной + Агентов"
+
+
+def classify_activity(rel: Release) -> str:
+    text = rel.description.lower()
+    if IOS_ID in rel.blob or ANDROID_ID in rel.blob or " ios " in f" {text} " or " android " in f" {text} ":
+        return "МП"
+    if any(task_id in rel.blob for task_id in NEURO_IDS):
+        return "Новая главная + Агенты"
+    if "launchpad" in text or "списка приложений" in text:
+        return "Ланчпад"
+    if "coreui-configurator" in text or "configurator" in text:
+        return "Configurator"
+    if "coreui(" in text or "hrp.coreui" in text:
+        return "CoreUI"
+    if "coretech(" in text or "coretech" in text:
+        return "CoreTech"
+    if "perftracker" in text:
+        return "PerfTracker"
+    if "landingbuilder" in text or "landing builder" in text:
+        return "Landing builder"
+
+    service_match = re.search(r"([A-Za-zА-Яа-я0-9\.\-]+)\(\d{6,8}\)", rel.description)
+    if service_match:
+        name = service_match.group(1)
+        if name.startswith("HRP.CoreUI-"):
+            name = name.replace("HRP.CoreUI-", "")
+        return name
+    return rel.key
+
+
+def summarize_activity(releases: Sequence[Release]) -> List[str]:
+    lines = [f"Релизная активность: {len(releases)} релизных задач"]
+    if not releases:
+        lines.append("Релизов не было")
+        return lines
+
+    counters = Counter(classify_activity(rel) for rel in releases)
+    ordered_names = [
+        "Ланчпад",
+        "CoreUI",
+        "CoreTech",
+        "Configurator",
+        "PerfTracker",
+        "Landing builder",
+        "МП",
+        "Новая главная + Агенты",
+    ]
+
+    used = set()
+    for name in ordered_names:
+        count = counters.get(name, 0)
+        if not count:
+            continue
+        used.add(name)
+        if count == 1:
+            lines.append(f"Релиз для {name}")
+        else:
+            lines.append(f"{count} {pluralize_releases(count)} для {name}")
+
+    for name, count in sorted(counters.items(), key=lambda item: (-item[1], item[0])):
+        if name in used:
+            continue
+        if count == 1:
+            lines.append(f"Релиз для {name}")
+        else:
+            lines.append(f"{count} {pluralize_releases(count)} для {name}")
+
+    return lines
+
+
+def build_final_text(mobile: Sequence[Release], main: Sequence[Release], activity: Sequence[Release]) -> str:
+    lines = [
+        "Мобильные приложения (RN, Android, iOS):",
+        summarize_mobile(mobile),
+        "",
+        "Новая главная + Агенты:",
+        summarize_main(main),
+        "",
+    ]
+    lines.extend(summarize_activity(activity))
+    return "\n".join(lines)
+
+
 def save_debug(html: str, releases: Sequence[Release]) -> None:
     DEBUG_HTML_PATH.write_text(html, encoding="utf-8")
     data = []
@@ -263,9 +410,7 @@ def update_presentation(
     slide_index: int,
     marker_text: str,
     section_title: str,
-    releases: Sequence[Release],
-    start: datetime,
-    end: datetime,
+    final_text: str,
 ) -> None:
     template_path = resolve_template_path(str(template_path))
 
@@ -285,14 +430,7 @@ def update_presentation(
     if target is None:
         raise RuntimeError("Не найден текстовый блок для релизов на первом слайде")
 
-    lines = [section_title, "--", f"Период: {start:%d.%m.%Y} - {end:%d.%m.%Y}"]
-    if releases:
-        for rel in releases:
-            date_label = rel.date_value.strftime("%d.%m") if rel.date_value else rel.date_raw
-            resp = f" ({rel.responsible})" if rel.responsible else ""
-            lines.append(f"- {rel.key} [{date_label}, {rel.status}] - {rel.description}{resp}")
-    else:
-        lines.append("Релизов не найдено")
+    lines = final_text.splitlines() or ["Релизов не найдено"]
 
     tf = target.text_frame
     tf.clear()
@@ -300,7 +438,7 @@ def update_presentation(
         p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         p.text = line
         p.level = 0
-        p.font.size = Pt(14 if idx < 3 else 12)
+        p.font.size = Pt(14 if idx in (0, 3) else 12)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(output_path))
@@ -354,15 +492,17 @@ def main() -> int:
         save_debug(html, releases)
         start, end = week_range()
         filtered = filter_weekly(releases, keywords, start, end)
+        mobile = detect_mobile_releases(filtered)
+        main_group = detect_main_releases(filtered)
+        final_text = build_final_text(mobile, main_group, filtered)
+        logger.info("Итоговый текст для слайда:\n%s", final_text)
         update_presentation(
             template_path=template_path,
             output_path=output_path,
             slide_index=slide_index,
             marker_text=marker_text,
             section_title=section_title,
-            releases=filtered,
-            start=start,
-            end=end,
+            final_text=final_text,
         )
         logger.info("Готово")
         return 0
